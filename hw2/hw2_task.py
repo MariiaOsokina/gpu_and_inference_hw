@@ -59,9 +59,18 @@ def generate_optimized(optimized_trace_name: str) -> float:
     # pass, adding hundreds of per-step aten::to / cudaFuncSetAttribute calls.
     # At this model scale per-step GPU work is already sub-millisecond, so the
     # extra CPU overhead outweighed the GPU savings (4.79x -> 4.32x). Reverted
-    # to fp32; see writeup. (bf16 would likely win on a larger model or once
-    # the per-op casts are fused away by torch.compile.)
+    # to fp32; see writeup. fp32 + inference_mode measured 6.61x.
     model = build_model(torch.float32)
+
+    # Fix #5: torch.compile. The profile shows this loop is CPU-launch-bound
+    # (CPU self-time ~3x the CUDA self-time over 12 steps): hundreds of tiny
+    # ops per step, each paying Python dispatch + a separate cudaLaunchKernel.
+    # torch.compile traces the forward into a fused graph, cutting the number
+    # of launches and the per-op overhead — directly attacking the bottleneck.
+    # Compilation happens on the first calls (during profile()), so the timed
+    # run below executes the already-warm graphs.
+    model = torch.compile(model)
+
     input_ids = get_input_ids()
     profile(optimized_loop, model, input_ids, optimized_trace_name)
     return time_generation(optimized_loop, model, input_ids, "Optimized")
