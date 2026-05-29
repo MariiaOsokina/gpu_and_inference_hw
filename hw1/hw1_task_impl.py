@@ -12,8 +12,7 @@ import torch
 
 def lowest_ai_fn(x: torch.Tensor) -> torch.Tensor:
     """Lowest arithmetic intensity baseline (0 FLOP/Byte)."""
-    # TODO (1 line): implement a lowest-AI op
-    pass
+    return x.clone()
 
 
 # TASK 1b: Implement a function with configurable arithmetic intensity.
@@ -37,10 +36,12 @@ def make_compute_fn(num_ops: int, compiled: bool = True):
     """Return an eager or compiled function whose work scales with num_ops."""
 
     def fn(x: torch.Tensor) -> torch.Tensor:
-        pass
+        acc = x
+        for _ in range(num_ops):
+            acc = acc * x + x
+        return acc
 
-    # TODO (1 line): return either `fn` or `torch.compile(fn)` based on `compiled`
-    pass
+    return torch.compile(fn) if compiled else fn
 
 
 # ============================================================================
@@ -62,8 +63,16 @@ def benchmark_fn(fn, *args, warmup=25, rep=100) -> float:
         fn(*args)
     torch.cuda.synchronize()
 
-    # TODO: time `rep` runs using CUDA events and return median latency (ms)
-    pass
+    times = []
+    for _ in range(rep):
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        fn(*args)
+        end.record()
+        torch.cuda.synchronize()
+        times.append(start.elapsed_time(end))
+    return float(torch.tensor(times).median())
 
 
 # TASK 3: Compute element-wise operation metrics from measured runtime.
@@ -83,8 +92,19 @@ def benchmark_fn(fn, *args, warmup=25, rep=100) -> float:
 
 
 def compute_elementwise_metrics(num_elements, num_ops, bytes_per_element, ms, variant):
-    # TODO: compute total FLOPs, arithmetic intensity, and achieved FLOP/s
-    pass
+    total_flops = num_elements * num_ops * 2  # 2 FLOPs per iteration (multiply + add)
+
+    if variant == "compiled":
+        # fused kernel: one read + one write at the kernel boundary
+        total_bytes = num_elements * bytes_per_element * 2
+    else:
+        # eager: each iteration materializes two intermediates (mul result, add result)
+        # per iteration: read acc + read x (mul) + write tmp + read tmp + read x (add) + write acc
+        # simplified: 4 tensors touched per iteration × num_ops, plus initial read + final write
+        total_bytes = num_elements * bytes_per_element * (4 * num_ops + 2)
+
+    ai = total_flops / total_bytes
+    achieved_flops = total_flops / (ms * 1e-3)
     return total_flops, ai, achieved_flops
 
 
