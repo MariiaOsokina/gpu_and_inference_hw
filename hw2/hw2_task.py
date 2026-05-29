@@ -14,16 +14,16 @@ from utils import (
 
 
 def optimized_loop(model, input_ids, n_steps):
-    # Fix #1: KV cache.
-    # The slow loop re-feeds the entire growing context every step, recomputing
-    # K and V for every prompt position on every decode token. With use_cache=True
-    # the model returns past_key_values; on subsequent steps we feed only the
-    # newest token and the cache appends one K,V column instead of rebuilding
-    # everything from scratch.
+    # Fix #1: KV cache (use_cache=True + past_key_values).
+    # Fix #2: defer .item() to end of loop. The slow loop calls .item() every
+    # step, forcing a host sync (CPU waits for all queued GPU work, copies one
+    # int back, resumes). Instead, store next_token_id as a tensor in a Python
+    # list during the loop, then concatenate and convert to ints once at the
+    # end — one sync total instead of n_steps.
     outputs = model(input_ids=input_ids, use_cache=True)
     past_key_values = outputs.past_key_values
     next_token_id = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
-    generated_tokens = [next_token_id.item()]
+    generated_tokens = [next_token_id]
 
     for _ in range(n_steps - 1):
         outputs = model(
@@ -33,9 +33,9 @@ def optimized_loop(model, input_ids, n_steps):
         )
         past_key_values = outputs.past_key_values
         next_token_id = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
-        generated_tokens.append(next_token_id.item())
+        generated_tokens.append(next_token_id)
 
-    return generated_tokens
+    return torch.cat(generated_tokens, dim=1).squeeze(0).tolist()
 
 
 def profile(loop_fn, model, input_ids, trace_name: str):
