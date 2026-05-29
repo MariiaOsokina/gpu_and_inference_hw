@@ -20,22 +20,27 @@ def optimized_loop(model, input_ids, n_steps):
     # int back, resumes). Instead, store next_token_id as a tensor in a Python
     # list during the loop, then concatenate and convert to ints once at the
     # end — one sync total instead of n_steps.
-    outputs = model(input_ids=input_ids, use_cache=True)
-    past_key_values = outputs.past_key_values
-    next_token_id = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
-    generated_tokens = [next_token_id]
-
-    for _ in range(n_steps - 1):
-        outputs = model(
-            input_ids=next_token_id,
-            past_key_values=past_key_values,
-            use_cache=True,
-        )
+    # Fix #4: torch.inference_mode() — disables autograd graph construction and
+    # version-counter bookkeeping. model.eval() already disables dropout but
+    # leaves autograd active; inference_mode is the stronger inference-only
+    # context that skips per-op gradient tracking entirely.
+    with torch.inference_mode():
+        outputs = model(input_ids=input_ids, use_cache=True)
         past_key_values = outputs.past_key_values
         next_token_id = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
-        generated_tokens.append(next_token_id)
+        generated_tokens = [next_token_id]
 
-    return torch.cat(generated_tokens, dim=1).squeeze(0).tolist()
+        for _ in range(n_steps - 1):
+            outputs = model(
+                input_ids=next_token_id,
+                past_key_values=past_key_values,
+                use_cache=True,
+            )
+            past_key_values = outputs.past_key_values
+            next_token_id = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
+            generated_tokens.append(next_token_id)
+
+        return torch.cat(generated_tokens, dim=1).squeeze(0).tolist()
 
 
 def profile(loop_fn, model, input_ids, trace_name: str):
@@ -101,3 +106,47 @@ if __name__ == "__main__":
 #
 # Biggest impact and why:
 #
+
+# ============================================================================
+# Writeup
+# ============================================================================
+#
+# Per-fix speedups (baseline: V0 slow loop, 1.64s for 128 tokens on L40S):
+#
+#   Fix #1 — KV cache (use_cache=True, past_key_values).
+#     1.64s → 0.34s = 4.79x
+#     The slow loop re-feeds the entire growing context every step, recomputing
+#     K,V for every prompt position. With use_cache=True the model returns a
+#     DynamicCache; decode steps feed only the new token and the cache appends
+#     one K,V column. Per-step work drops from O(seq_len) to O(1) for the Q/K/V
+#     projections and MLP. Profiler confirms: aten::mm self CUDA fell from
+#     108 ms to 16 ms (-85%) and the kernels switched from SGEMM to GEMV
+#     (matrix-vector) because each decode step is shape (1, 1, hidden).
+#
+#   Fix #2 — Defer .item() to end of loop.
+#     4.79x → 4.79x  (no wall-clock change)
+#     Removed 128 per-step host syncs. Profiler shows CPU drop of -2.4 ms over
+#     12 profile steps, confirming syncs disappeared. Wall-clock unchanged
+#     because per-step GPU work is only ~1.8 ms and the CPU wasn't queueing
+#     far enough ahead for sync removal to matter. Pattern still kept; would
+#     pay off on a larger model.
+#
+#   Fix #3 — bf16 weights and KV cache (REVERTED).
+#     4.79x → 4.32x  (regressed)
+#     GPU side worked: kernels switched to bf16 Tensor Core variants
+#     (cutlass_80_tensorop_bf16_*, flash attention), CUDA self time fell from
+#     22 ms to 7.6 ms over 12 profile steps (-66%). But HF Llama keeps fp32
+#     buffers (RoPE inv_freq, scales) and casts them per forward pass:
+#     +269 aten::to and +173 aten::_to_copy calls in 12 steps, plus 372
+#     cudaFuncSetAttribute configurations for Tensor Core kernels. CPU self
+#     time jumped from 82 ms to 192 ms (+135%). At this model scale per-step
+#     GPU work was already ~1.8 ms; the extra CPU overhead outweighed the
+#     GPU savings. Reverted.
+#
+# Biggest impact: KV cache (fix #1).
+#   Why: it's the only fix that changes algorithmic cost. The slow loop's
+#   total work scales O(prompt_len * n_steps) because every decode step
+#   re-prefills the full context. KV cache drops this to
+#   O(prompt_len + n_steps * (1 + avg_attn_read)) — essentially O(n_steps)
+#   for the dominant Q,K,V projection and MLP work. All other fixes are
+#   constant-factor; this one changes the asymptotic structure of the loop.
