@@ -60,6 +60,15 @@ def generate_optimized(optimized_trace_name: str) -> float:
     # At this model scale per-step GPU work is already sub-millisecond, so the
     # extra CPU overhead outweighed the GPU savings (4.79x -> 4.32x). Reverted
     # to fp32; see writeup. fp32 + inference_mode measured 6.61x.
+
+    # Fix #6: enable TF32. Lets fp32 matmuls use the Ada/Ampere tensor-core
+    # TF32 path (10-bit mantissa, fp32 range) instead of the slow full-fp32
+    # kernels. Unlike bf16 (fix #3), this does NOT change the model dtype, so
+    # it adds no per-step cast ops — the regression that sank bf16. Set here
+    # (not at module level) so it applies only to the optimized run; the V0
+    # slow baseline already ran and stays at default full-fp32 precision.
+    torch.set_float32_matmul_precision("high")
+
     model = build_model(torch.float32)
 
     # Fix #5: torch.compile. The profile shows this loop is CPU-launch-bound
