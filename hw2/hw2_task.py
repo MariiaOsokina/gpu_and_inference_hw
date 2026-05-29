@@ -1,4 +1,7 @@
 import torch
+from torch.profiler import ProfilerActivity
+from torch.profiler import profile as torch_profile
+
 from utils import (
     build_model,
     get_input_ids,
@@ -25,16 +28,19 @@ def optimized_loop(model, input_ids, n_steps):
 
 
 def profile(loop_fn, model, input_ids, trace_name: str):
-    # TODO: wrap loop_fn(model, input_ids, PROFILE_STEPS) with torch.profiler,
-    # print the summary table, and export a Chrome trace to RESULTS_DIR / trace_name
-    pass
+    with torch_profile(
+        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+    ) as prof:
+        loop_fn(model, input_ids, PROFILE_STEPS)
+    print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=20))
+    prof.export_chrome_trace(str(RESULTS_DIR / trace_name))
 
 
 def generate_optimized(optimized_trace_name: str) -> float:
-    # TODO: load the model (consider dtype and other loading options),
-    # then call profile() and time_generation() on optimized_loop.
-    # Return the elapsed time from time_generation so main() can print a speedup.
-    pass
+    model = build_model(torch.float32)
+    input_ids = get_input_ids()
+    profile(optimized_loop, model, input_ids, optimized_trace_name)
+    return time_generation(optimized_loop, model, input_ids, "Optimized")
 
 
 def main():
