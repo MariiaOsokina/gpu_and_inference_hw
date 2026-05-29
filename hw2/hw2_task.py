@@ -53,11 +53,15 @@ def profile(loop_fn, model, input_ids, trace_name: str):
 
 
 def generate_optimized(optimized_trace_name: str) -> float:
-    # Fix #3: bf16 weights and KV. Halves memory traffic on the model weights
-    # and the KV cache; routes matmuls through Tensor Cores (L40S BF16 peak
-    # ~362 TFLOP/s vs FP32 ~91 TFLOP/s). Decode is memory-bound so the
-    # bandwidth halving matters even more than the FLOP boost.
-    model = build_model(torch.bfloat16)
+    # Fix #3 (reverted): bf16 weights/KV. On the GPU side bf16 worked — matmuls
+    # dispatched to Tensor Core kernels and CUDA self-time fell ~66% — but HF
+    # Llama casts several fp32 buffers (RoPE inv_freq, scales) every forward
+    # pass, adding hundreds of per-step aten::to / cudaFuncSetAttribute calls.
+    # At this model scale per-step GPU work is already sub-millisecond, so the
+    # extra CPU overhead outweighed the GPU savings (4.79x -> 4.32x). Reverted
+    # to fp32; see writeup. (bf16 would likely win on a larger model or once
+    # the per-op casts are fused away by torch.compile.)
+    model = build_model(torch.float32)
     input_ids = get_input_ids()
     profile(optimized_loop, model, input_ids, optimized_trace_name)
     return time_generation(optimized_loop, model, input_ids, "Optimized")
