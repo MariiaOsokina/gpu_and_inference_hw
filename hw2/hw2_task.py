@@ -14,16 +14,27 @@ from utils import (
 
 
 def optimized_loop(model, input_ids, n_steps):
-    # TODO: fix the performance issues you found — changes may include
-    # both `optimized_loop` and `generate_optimized`
-    generated_ids = input_ids.clone()
-    generated_tokens = []
-    for _ in range(n_steps):
-        outputs = model(input_ids=generated_ids)
-        next_token_id = torch.argmax(outputs.logits[:, -1, :], dim=-1)
-        token_value = next_token_id.item()
-        generated_tokens.append(token_value)
-        generated_ids = torch.cat([generated_ids, next_token_id.unsqueeze(0)], dim=1)
+    # Fix #1: KV cache.
+    # The slow loop re-feeds the entire growing context every step, recomputing
+    # K and V for every prompt position on every decode token. With use_cache=True
+    # the model returns past_key_values; on subsequent steps we feed only the
+    # newest token and the cache appends one K,V column instead of rebuilding
+    # everything from scratch.
+    outputs = model(input_ids=input_ids, use_cache=True)
+    past_key_values = outputs.past_key_values
+    next_token_id = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
+    generated_tokens = [next_token_id.item()]
+
+    for _ in range(n_steps - 1):
+        outputs = model(
+            input_ids=next_token_id,
+            past_key_values=past_key_values,
+            use_cache=True,
+        )
+        past_key_values = outputs.past_key_values
+        next_token_id = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
+        generated_tokens.append(next_token_id.item())
+
     return generated_tokens
 
 
