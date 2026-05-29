@@ -48,7 +48,11 @@ def profile(loop_fn, model, input_ids, trace_name: str):
 
 
 def generate_optimized(optimized_trace_name: str) -> float:
-    model = build_model(torch.float32)
+    # Fix #3: bf16 weights and KV. Halves memory traffic on the model weights
+    # and the KV cache; routes matmuls through Tensor Cores (L40S BF16 peak
+    # ~362 TFLOP/s vs FP32 ~91 TFLOP/s). Decode is memory-bound so the
+    # bandwidth halving matters even more than the FLOP boost.
+    model = build_model(torch.bfloat16)
     input_ids = get_input_ids()
     profile(optimized_loop, model, input_ids, optimized_trace_name)
     return time_generation(optimized_loop, model, input_ids, "Optimized")
