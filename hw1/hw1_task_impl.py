@@ -116,13 +116,34 @@ def compute_elementwise_metrics(num_elements, num_ops, bytes_per_element, ms, va
 # Q1. Look at the compiled element-wise operations from `1 ops` through `64 ops`.
 # Why does performance rise as arithmetic intensity increases even though the
 # measured runtime changes only a little?
-#
+#Q1 — Compiled 1→128 ops: runtime is nearly identical every step (~0.868 ms). 
+# But TFLOP/s doubles each time because FLOPs double while time stays constant. 
+# All points are still left of ridge point (106 FLOP/Byte) — memory-bound, same bytes moved, 
+# just more useful work done per pass.
+
 # Q2. In one sample run, `matmul 1024x1024` achieved lower FLOP/s than the
 # `128 ops` compiled element-wise operation. Give one or two reasons why that can
 # happen on a large GPU like an H100.
-#
+#Q2 — matmul 1024×1024 achieved 23.5 TFLOP/s vs 128-ops compiled at 19.8 TFLOP/s — actually matmul 1024 is higher here. 
+# The question is written for H100 (ridge=20), but your answer should explain: small matmul (1024) doesn't saturate 
+# all SMs on a large GPU, so only 25% of peak compute is used. cuBLAS needs large tiles to be efficient.
+
 # Q3. Between `64 ops` and `128 ops`, runtime increases more noticeably than it
 # did for smaller operations. What does that suggest about what resource is
 # becoming the bottleneck?
-#
+#Q3 — A noticeable runtime increase as ops grow means the kernel has crossed the
+# ridge into compute-bound territory: FP32 compute throughput (the FMA/ALU units),
+# not memory bandwidth, is now the bottleneck. Past the ridge, extra FLOPs at fixed
+# byte traffic can no longer hide behind the memory transfer, so time climbs.
+# On H100 (ridge=20) this lines up with the 64→128 range: 64 ops (AI=16) is still
+# memory-bound, 128 ops (AI=32) is compute-bound, so runtime jumps between them.
+# On my L40S (ridge=106) both 64 ops (AI=16) and 128 ops (AI=32) are still far left
+# of the ridge, so they stay memory-bound and runtime is flat (~0.868ms both).
+
 # Q4. Why do the eager `ops-K` points look so different from the compiled ones?
+#Q4 — Eager AI stays flat (0.083→0.125 FLOP/Byte) while compiled marches right (0.25→32). 
+# Each eager iteration writes two intermediates back to global memory and reads them again next iteration — 
+# bytes scale with num_ops. 
+# Compiled fuses everything into one kernel: one read, one write regardless of num_ops.
+# Interesting anomaly to mention: matmul 4096 (35.1 TFLOP/s) underperforms matmul 2048 (42.4 TFLOP/s) — at 4096 the matrices are ~256MB total, exceeding L2 cache, causing more cache misses.
+

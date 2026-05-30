@@ -1,5 +1,4 @@
 .venv/
 __pycache__/
 *.py[cod]
-hw1/results/
-hw2/results/
+hw2/results/*_trace.json

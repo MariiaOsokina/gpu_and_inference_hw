@@ -123,52 +123,137 @@ if __name__ == "__main__":
 # Writeup
 # ============================================================================
 #
-# Changes made and speedup per fix:
+# Hardware: 1x NVIDIA L40S (compute capability 8.9). All numbers are the
+# Speedup that time_generation() reports for the optimized loop against the
+# unmodified V0 slow baseline (128 tokens from a 1024-token prompt). The V0
+# baseline measures ~1.63-1.64s across runs. "Profiler" figures are CPU/CUDA
+# self-time totals over the 12-step profile run, used to explain *why* a fix
+# helped (or did not); the Speedup column is from the un-profiled timed run.
 #
+# Note on the baseline: the README example baseline is ~21s, but on the L40S
+# this tiny 2-layer model runs the V0 loop in ~1.64s. The grading metric is
+# the *ratio*, and both sides run on the same GPU, so the tiers still apply.
+# A side effect of the small absolute time is that the loop becomes CPU-launch
+# -bound quickly, which shapes the results below.
 #
-# Biggest impact and why:
+# Note on the optimized trace (v1_optimized_trace.json): because torch.compile
+# (#5) compiles and autotunes on the first calls, and profile() runs first,
+# the optimized trace captures the one-time compilation/autotuning storm
+# (InductorBenchmarker, CachingAutotuner, thousands of aten::fill_/zero_ from
+# autotuning scratch buffers, _recursive_joint_graph_passes). That bookkeeping
+# dwarfs the actual generation in the trace. The part that reflects the real
+# steady-state loop is the compiled decode graph, labeled "Torch-Compiled
+# Region: 0/2" (runs once per decode step, ~1.1ms each); Dynamo also emits two
+# one-shot graphs for prefill and the first-decode shape. The un-profiled
+# time_generation() run (the reported Speedup) is unaffected since it executes
+# the already-warm graphs.
 #
-
-# ============================================================================
-# Writeup
-# ============================================================================
+# ----------------------------------------------------------------------------
+# Per-fix progression (each fix is cumulative on top of the previous, except
+# bf16 which was measured and then reverted):
 #
-# Per-fix speedups (baseline: V0 slow loop, 1.64s for 128 tokens on L40S):
+#   V0  slow baseline ........................................ 1.00x  (1.64s)
+#   #1  + KV cache ........................................... 4.79x  (0.34s)
+#   #2  + defer .item() ...................................... 4.79x  (0.34s)
+#   #3  + bf16 (REVERTED) .................................... 4.32x  (0.38s)
+#   #4  + torch.inference_mode() ............................. 6.61x  (0.25s)
+#   #5  + torch.compile() ................................... 10.71x  (0.15s)
+#   #6  + TF32 matmul precision ............................. 11.20x  (0.15s)
+#
+#   Final optimized loop: 11.20x over V0.
+#
+# ----------------------------------------------------------------------------
+# What each fix changed and why:
 #
 #   Fix #1 — KV cache (use_cache=True, past_key_values).
-#     1.64s → 0.34s = 4.79x
-#     The slow loop re-feeds the entire growing context every step, recomputing
-#     K,V for every prompt position. With use_cache=True the model returns a
-#     DynamicCache; decode steps feed only the new token and the cache appends
-#     one K,V column. Per-step work drops from O(seq_len) to O(1) for the Q/K/V
-#     projections and MLP. Profiler confirms: aten::mm self CUDA fell from
-#     108 ms to 16 ms (-85%) and the kernels switched from SGEMM to GEMV
-#     (matrix-vector) because each decode step is shape (1, 1, hidden).
+#     1.00x -> 4.79x.
+#     The slow loop re-feeds the whole growing sequence every step, recomputing
+#     K,V for every prompt position it already processed. Total work scales
+#     O(prompt_len * n_steps). With use_cache=True the model returns a
+#     DynamicCache; each decode step feeds only the 1 new token and the cache
+#     appends one K,V column. Profiler: aten::mm self-CUDA fell 108ms -> 16ms
+#     (-85%) over 12 steps, and the matmul kernels switched from SGEMM to GEMV
+#     (matrix-vector, gemv2T_kernel) because each decode step is shape (1,1,H).
+#     The decode GEMV kernels are bandwidth-bound (read full weight matrix x a
+#     1-column input) — the classic memory-bound decode signature.
 #
 #   Fix #2 — Defer .item() to end of loop.
-#     4.79x → 4.79x  (no wall-clock change)
-#     Removed 128 per-step host syncs. Profiler shows CPU drop of -2.4 ms over
-#     12 profile steps, confirming syncs disappeared. Wall-clock unchanged
-#     because per-step GPU work is only ~1.8 ms and the CPU wasn't queueing
-#     far enough ahead for sync removal to matter. Pattern still kept; would
-#     pay off on a larger model.
+#     4.79x -> 4.79x (no wall-clock change).
+#     The slow loop calls .item() every step, forcing a host sync (CPU waits
+#     for all queued GPU work, copies one int back, resumes). I keep tokens as
+#     (1,1) tensors in a Python list and convert once at the end with a single
+#     torch.cat(...).tolist() — one sync instead of 128. Profiler confirms the
+#     CPU self-time dropped ~2.4ms over 12 steps and the per-step
+#     cudaMemcpy/sync events disappeared from inside the loop. Wall-clock did
+#     NOT move: per-step GPU work is only ~1.8ms and the CPU was not queueing
+#     far enough ahead for sync removal to matter at this scale. Kept anyway —
+#     it is structurally correct and would pay off on a larger model.
 #
 #   Fix #3 — bf16 weights and KV cache (REVERTED).
-#     4.79x → 4.32x  (regressed)
-#     GPU side worked: kernels switched to bf16 Tensor Core variants
-#     (cutlass_80_tensorop_bf16_*, flash attention), CUDA self time fell from
-#     22 ms to 7.6 ms over 12 profile steps (-66%). But HF Llama keeps fp32
-#     buffers (RoPE inv_freq, scales) and casts them per forward pass:
-#     +269 aten::to and +173 aten::_to_copy calls in 12 steps, plus 372
-#     cudaFuncSetAttribute configurations for Tensor Core kernels. CPU self
-#     time jumped from 82 ms to 192 ms (+135%). At this model scale per-step
-#     GPU work was already ~1.8 ms; the extra CPU overhead outweighed the
-#     GPU savings. Reverted.
+#     4.79x -> 4.32x (regressed).
+#     The GPU side worked exactly as intended: kernels switched to bf16 Tensor
+#     Core variants (cutlass_80_tensorop_bf16_*, and attention switched to
+#     flash attention), and CUDA self-time fell 22ms -> 7.6ms (-66%) over 12
+#     steps. But HF Llama keeps several fp32 buffers (RoPE inv_freq, attention
+#     scales) and casts them on every forward pass: the profiler showed +269
+#     aten::to and +173 aten::_to_copy calls plus 372 cudaFuncSetAttribute
+#     configurations for the Tensor Core kernels. CPU self-time jumped 82ms ->
+#     192ms (+135%). Because the loop is CPU-launch-bound at this scale, the
+#     extra CPU overhead outweighed the GPU savings. Confirmed by a clean A/B
+#     with everything else fixed: fp32 = 6.61x vs bf16 = 5.95x. Reverted to
+#     fp32. (bf16 would likely win on a larger model where per-step GPU work
+#     dominates, or once the casts are fused away.)
 #
-# Biggest impact: KV cache (fix #1).
-#   Why: it's the only fix that changes algorithmic cost. The slow loop's
-#   total work scales O(prompt_len * n_steps) because every decode step
-#   re-prefills the full context. KV cache drops this to
-#   O(prompt_len + n_steps * (1 + avg_attn_read)) — essentially O(n_steps)
-#   for the dominant Q,K,V projection and MLP work. All other fixes are
-#   constant-factor; this one changes the asymptotic structure of the loop.
+#   Fix #4 — torch.inference_mode() around the loop.
+#     4.79x -> 6.61x.
+#     model.eval() (set in build_model) only disables dropout/BN; autograd is
+#     still active, so every forward builds a graph, saves activations, and
+#     bumps version counters on in-place ops. inference_mode is the stronger
+#     inference-only context that skips all of that. The per-op saving is tiny
+#     (below profiler resolution, so the summary table barely moves), but HF
+#     Llama runs hundreds of in-place ops per step, so across 128 steps it
+#     removed ~100ms of pure CPU bookkeeping -> 0.25s. This is a good example
+#     of a fix that is invisible in the op table but clear in wall-clock.
+#
+#   Fix #5 — torch.compile(model).
+#     6.61x -> 10.71x.
+#     The diagnosis from the profiles was that the loop is CPU-launch-bound:
+#     CPU self-time (~73ms) was ~3x the CUDA self-time (~22ms) over 12 steps,
+#     i.e. hundreds of tiny ops per step each paying Python dispatch + a
+#     separate cudaLaunchKernel. torch.compile traces the forward into fused
+#     Triton kernels (e.g. one kernel named
+#     triton_red_fused_add_embedding_mean_mul_pow_rsqrt collapses the whole
+#     RMSNorm+residual chain), cutting the number of launches and per-op
+#     overhead — directly attacking the bottleneck. Dynamo produced 3 graphs
+#     (prefill, a transitional first-decode shape, and the steady-state decode
+#     graph that runs every step) with no per-step recompilation. Compilation
+#     happens on the first calls inside profile(), so the timed run is warm.
+#
+#   Fix #6 — TF32 matmul precision (set_float32_matmul_precision("high")).
+#     10.71x -> 11.20x.
+#     Lets fp32 matmuls use the L40S tensor-core TF32 path (10-bit mantissa,
+#     full fp32 range) instead of slow full-fp32 kernels. Unlike bf16 (#3),
+#     this does NOT change the model dtype, so it adds no per-step cast ops —
+#     the regression that sank bf16. Set inside generate_optimized() (not at
+#     module level) so it applies only to the optimized run; the V0 baseline
+#     already ran and stays at default full-fp32 precision. Profiler: the
+#     compiled matmuls switched to cutlass_80_tensorop_s1688gemm (TF32) kernels
+#     and the prior TF32 warning disappeared. Small wall-clock gain because,
+#     after compile removed the launch overhead, matmuls were already a small
+#     fraction of the remaining ~1.1ms/step — little matmul time left to save.
+#
+# ----------------------------------------------------------------------------
+# Biggest impact: Fix #1, the KV cache (1.00x -> 4.79x).
+#   It is the only fix that changes the algorithmic cost of the loop. The slow
+#   loop's total work is O(prompt_len * n_steps) because every decode step
+#   re-prefills the entire context. The KV cache drops the dominant Q/K/V
+#   projection and MLP work to O(n_steps) (attention still reads the growing
+#   cache, O(prompt_len + n_steps) per step). Every other fix is a
+#   constant-factor improvement on top of that; #1 changes the asymptotics, so
+#   it both delivers the single largest jump and is what makes the later fixes
+#   (which target per-step overhead) worthwhile — there are no longer giant
+#   re-prefill matmuls hiding the launch overhead that #4 and #5 remove.
+#
+# Second-biggest: Fix #5, torch.compile (6.61x -> 10.71x). After the KV cache
+#   exposed that the loop was CPU-launch-bound, fusing the per-step ops into a
+#   few Triton kernels was the highest-leverage remaining change.

@@ -1,0 +1,75 @@
+/home/mosokina/homework_gpu_infr_fork/.venv/lib/python3.12/site-packages/torch/_inductor/compile_fx.py:312: UserWarning: TensorFloat32 tensor cores for float32 matrix multiplication available but not enabled. Consider setting `torch.set_float32_matmul_precision('high')` for better performance.
+  warnings.warn(
+============================================================
+HW2: LLM Inference Optimization
+Model: Tiny random Llama (2 layers, d_model=2048)
+============================================================
+
+--- Part 1: Slow baseline ---
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+                                                   Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg    # of Calls  
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+                                           aten::matmul         0.41%       1.161ms        27.84%      79.286ms     412.945us       0.000us         0.00%     108.451ms     564.851us           192  
+                                           aten::linear         0.19%     537.170us         6.33%      18.034ms     100.186us       0.000us         0.00%     108.421ms     602.336us           180  
+                                               aten::mm         2.06%       5.861ms         4.80%      13.676ms      75.979us     107.626ms        86.24%     108.421ms     602.336us           180  
+                                 ampere_sgemm_128x64_tn         0.00%       0.000us         0.00%       0.000us       0.000us     107.448ms        86.10%     107.448ms     596.936us           180  
+                     aten::scaled_dot_product_attention         0.09%     263.031us         1.01%       2.890ms     120.426us       0.000us         0.00%       9.551ms     397.975us            24  
+          aten::_scaled_dot_product_efficient_attention         0.16%     459.823us         0.92%       2.627ms     109.466us       0.000us         0.00%       9.551ms     397.975us            24  
+                     aten::_efficient_attention_forward         0.12%     349.956us         0.67%       1.900ms      79.183us       8.836ms         7.08%       9.551ms     397.975us            24  
+fmha_cutlassF_f32_aligned_32x128_gmem_sm80(PyTorchMe...         0.00%       0.000us         0.00%       0.000us       0.000us       8.836ms         7.08%       8.836ms     368.163us            24  
+                                              aten::mul         1.15%       3.283ms         4.20%      11.964ms      45.317us       3.235ms         2.59%       3.292ms      12.471us           264  
+void at::native::elementwise_kernel<128, 2, at::nati...         0.00%       0.000us         0.00%       0.000us       0.000us       2.070ms         1.66%       2.070ms       9.584us           216  
+                                              aten::cat         0.61%       1.731ms         2.55%       7.262ms      60.514us       1.630ms         1.31%       1.654ms      13.782us           120  
+void at::native::(anonymous namespace)::CatArrayBatc...         0.00%       0.000us         0.00%       0.000us       0.000us       1.545ms         1.24%       1.545ms      16.094us            96  
+                                              aten::add         0.71%       2.026ms         3.99%      11.371ms      72.892us       1.497ms         1.20%       1.531ms       9.815us           156  
+                       Runtime Triggered Module Loading        34.96%      99.563ms        34.96%      99.563ms       2.766ms       1.139ms         0.91%       1.139ms      31.628us            36  
+void at::native::vectorized_elementwise_kernel<4, at...         0.00%       0.000us         0.00%       0.000us       0.000us       1.120ms         0.90%       1.120ms      46.686us            24  
+void at::native::vectorized_elementwise_kernel<4, at...         0.00%       0.000us         0.00%       0.000us       0.000us       1.002ms         0.80%       1.002ms      20.866us            48  
+          cudaOccupancyMaxActiveBlocksPerMultiprocessor         0.08%     225.930us         1.16%       3.304ms      16.196us       0.000us         0.00%     794.592us       3.895us           204  
+                                   cudaFuncSetAttribute         0.02%      64.402us         0.36%       1.035ms      43.118us       0.000us         0.00%     715.491us      29.812us            24  
+                                  Lazy Function Loading         0.25%     699.395us         0.25%     699.395us      30.408us     664.833us         0.53%     664.833us      28.906us            23  
+                                             aten::silu         0.15%     423.972us         1.83%       5.219ms     217.452us     467.648us         0.37%     526.592us      21.941us            24  
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+Self CPU time total: 284.820ms
+Self CUDA time total: 124.802ms
+
+Slow: 128 tokens in 1.63s (78.4 tok/s)
+Token preview: [775, 1973, 97, 2453, 295, 695, 775, 866]
+
+--- Part 2: Optimized ---
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+                                                   Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg    # of Calls  
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+       InductorBenchmarker.benchmark_gpu (dynamo_timed)         0.00%       0.000us         0.00%       0.000us       0.000us        1.044s       100.13%        1.044s      31.641ms            33  
+CachingAutotuner.benchmark_all_configs (dynamo_timed...         0.08%      10.807ms         7.83%        1.081s      83.151ms       0.000us         0.00%        1.022s      78.604ms            13  
+       InductorBenchmarker.benchmark_gpu (dynamo_timed)         1.30%     179.814ms         7.75%        1.070s      32.429ms       0.000us         0.00%        1.022s      30.965ms            33  
+                                            aten::fill_         0.19%      26.295ms         0.42%      57.748ms       8.470us     904.142ms        86.71%     904.213ms     132.621us          6818  
+                                            aten::zero_         0.19%      26.186ms         0.59%      81.412ms      11.257us       0.000us         0.00%     904.199ms     125.028us          7232  
+void at::native::vectorized_elementwise_kernel<4, at...         0.00%       0.000us         0.00%       0.000us       0.000us     904.131ms        86.71%     904.131ms     133.000us          6798  
+                             Torch-Compiled Region: 0/0         0.02%       3.386ms         4.31%     595.810ms     595.810ms       0.000us         0.00%     566.086ms     566.086ms             1  
+## Call CompiledFxGraph fzntg247zkztrhvplrqkstvemazu...         0.02%       2.705ms         4.29%     592.370ms     592.370ms       0.000us         0.00%     566.086ms     566.086ms             1  
+## Call CompiledFxGraph fzntg247zkztrhvplrqkstvemazu...         0.00%       0.000us         0.00%       0.000us       0.000us     421.646ms        40.44%     421.646ms     421.646ms             1  
+## Call CompiledFxGraph ftjrsk5v3is5rdd6ft2rhapfdd4z...         0.00%       0.000us         0.00%       0.000us       0.000us     318.828ms        30.58%     318.828ms     318.828ms             1  
+                             Torch-Compiled Region: 0/1         0.02%       2.294ms         2.33%     321.179ms     321.179ms       0.000us         0.00%     293.103ms     293.103ms             1  
+## Call CompiledFxGraph ftjrsk5v3is5rdd6ft2rhapfdd4z...         0.02%       2.490ms         2.31%     318.848ms     318.848ms       0.000us         0.00%     293.103ms     293.103ms             1  
+## Call CompiledFxGraph fqcbdw37eiph5siz4detzl3p2iba...         0.00%       0.000us         0.00%       0.000us       0.000us     198.162ms        19.00%     198.162ms      19.816ms            10  
+                             Torch-Compiled Region: 0/2         0.02%       2.599ms         1.44%     199.230ms      19.923ms       0.000us         0.00%     183.950ms      18.395ms            10  
+## Call CompiledFxGraph fqcbdw37eiph5siz4detzl3p2iba...         0.04%       5.980ms         1.42%     196.352ms      19.635ms       0.000us         0.00%     183.950ms      18.395ms            10  
+           _recursive_joint_graph_passes (dynamo_timed)         0.00%       0.000us         0.00%       0.000us       0.000us     166.208ms        15.94%     166.208ms      55.403ms             3  
+triton_poi_fused__scaled_dot_product_efficient_atten...         0.05%       7.235ms         0.07%      10.277ms      16.107us      34.673ms         3.33%      34.673ms      54.346us           638  
+triton_poi_fused__scaled_dot_product_efficient_atten...         0.00%       0.000us         0.00%       0.000us       0.000us      34.673ms         3.33%      34.673ms      54.346us           638  
+    triton_red_fused_add_embedding_mean_mul_pow_rsqrt_0         0.04%       5.128ms         0.06%       7.836ms      14.458us      32.588ms         3.13%      32.588ms      60.125us           542  
+    triton_red_fused_add_embedding_mean_mul_pow_rsqrt_0         0.00%       0.000us         0.00%       0.000us       0.000us      32.588ms         3.13%      32.588ms      60.125us           542  
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+Self CPU time total: 13.809s
+Self CUDA time total: 1.043s
+
+Optimized: 128 tokens in 0.15s (840.0 tok/s)
+Token preview: [775, 1973, 97, 2453, 295, 695, 775, 866]
+
+============================================================
+SUMMARY
+============================================================
+  Slow:        1.63s
+  Optimized:   0.15s
+  Speedup:    10.71x  (vs V0 slow baseline)
