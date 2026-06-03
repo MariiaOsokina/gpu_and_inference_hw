@@ -116,34 +116,89 @@ def compute_elementwise_metrics(num_elements, num_ops, bytes_per_element, ms, va
 # Q1. Look at the compiled element-wise operations from `1 ops` through `64 ops`.
 # Why does performance rise as arithmetic intensity increases even though the
 # measured runtime changes only a little?
-#Q1 — Compiled 1→128 ops: runtime is nearly identical every step (~0.868 ms). 
-# But TFLOP/s doubles each time because FLOPs double while time stays constant. 
-# All points are still left of ridge point (106 FLOP/Byte) — memory-bound, same bytes moved, 
-# just more useful work done per pass.
+#Q1 — #These compiled element-wise ops are memory-bound — the slow part is moving the 256 MB tensor in and out of VRAM, not the math. 
+# Because the kernel is fused, it reads the tensor once and writes it once regardless of num_ops, so the bytes moved (and therefore the time) 
+# stay fixed at ~0.868 ms every step.
+#  Performance = FLOPs ÷ time. Each step doubles the FLOPs while time stays constant, so achieved TFLOP/s doubles too. 
+# The extra math is ~10× faster than the memory transfer and overlaps with it — the cores compute on data already 
+# loaded while the rest streams in — so the math "hides" under the fixed transfer time and the clock doesn't move.
+#   All points stay left of the ridge point (106 FLOP/Byte on the L40S): same bytes moved, 
+# just more useful work per pass, so they climb the slanted bandwidth ceiling instead of adding runtime. 
+# This would only stop once the math exceeds the transfer time (crossing into compute-bound) — 
+# which never happens here, 
+# since even 64 ops only reaches AI = 16.
+
 
 # Q2. In one sample run, `matmul 1024x1024` achieved lower FLOP/s than the
 # `128 ops` compiled element-wise operation. Give one or two reasons why that can
 # happen on a large GPU like an H100.
-#Q2 — matmul 1024×1024 achieved 23.5 TFLOP/s vs 128-ops compiled at 19.8 TFLOP/s — actually matmul 1024 is higher here. 
-# The question is written for H100 (ridge=20), but your answer should explain: small matmul (1024) doesn't saturate 
-# all SMs on a large GPU, so only 25% of peak compute is used. cuBLAS needs large tiles to be efficient.
+
+
+#Q2 — Peak FLOP/s requires saturating the GPU — keeping all its SMs (worker crews; an H100 has 132) busy. 
+# A 1024×1024 matmul produces only ~1M outputs; split across so many SMs, each crew gets a tiny slice, finishes fast, then sits idle. 
+# Two effects follow:
+
+# 1 - Under-saturation: too little work per crew means launch/setup overhead becomes a large fraction of the total, 
+# so only ~25% of peak compute is used.
+# 2 - cuBLAS needs large tiles: the matmul library splits matrices into square tiles, one per crew, 
+# and its optimizations only run at full speed when the matrices are big enough to form full tiles. 
+# A small 1024 matrix can't fill them.
+
+#Meanwhile the 128 ops element-wise op runs over 67M elements — far more independent work — 
+# so it fully saturates the GPU and posts high FLOP/s.
+
+# Hence the upset: the matmul is a compute-heavy type of work but there's too little of it to fill a big GPU, 
+# while the element-wise op is simpler but has tons of work. 
+# Making the matmul bigger (2048, 4096) gives enough work to saturate the chip, 
+# and it pulls ahead toward the compute ceiling.
+
+#(Note: on my L40S this flip didn't actually occur — matmul-1024 hit 23.5 TFLOP/s vs 19.8 for 128-ops. 
+# The effect is described for the larger H100, where idle SMs are easier to create.)
+
 
 # Q3. Between `64 ops` and `128 ops`, runtime increases more noticeably than it
 # did for smaller operations. What does that suggest about what resource is
 # becoming the bottleneck?
-#Q3 — A noticeable runtime increase as ops grow means the kernel has crossed the
-# ridge into compute-bound territory: FP32 compute throughput (the FMA/ALU units),
-# not memory bandwidth, is now the bottleneck. Past the ridge, extra FLOPs at fixed
-# byte traffic can no longer hide behind the memory transfer, so time climbs.
-# On H100 (ridge=20) this lines up with the 64→128 range: 64 ops (AI=16) is still
-# memory-bound, 128 ops (AI=32) is compute-bound, so runtime jumps between them.
-# On my L40S (ridge=106) both 64 ops (AI=16) and 128 ops (AI=32) are still far left
-# of the ridge, so they stay memory-bound and runtime is flat (~0.868ms both).
+#Q3 — A runtime that finally starts climbing means the bottleneck has switched from
+# moving data to doing math — the kernel has crossed the ridge point from
+# memory-bound into compute-bound territory.
+#
+# Mechanism: for small ops the math "hid" underneath the fixed memory transfer (the
+# cores compute on already-loaded data while the rest streams in), so adding math was
+# free and the clock stayed flat. That only works while the math is shorter than the
+# transfer. Once you pile on enough operations, the math itself grows longer than the
+# memory transfer — it no longer fits underneath, sticks out past the end, and the
+# runtime starts to rise. At that point the limiting resource is the FP32 arithmetic
+# units (the FMA/ALU hardware), not memory bandwidth.
+#
+# Where the ridge sits decides when this happens, and the two GPUs differ sharply:
+#                 ridge point   64 ops (AI=16)   128 ops (AI=32)
+#   H100          20            memory-bound     compute-bound
+#   My L40S       106           memory-bound     memory-bound
+# On an H100 (ridge=20) the crossover lands exactly in the 64->128 gap: 64 ops is
+# still left of the ridge, 128 ops is past it, so runtime jumps between them.
+# On my L40S (ridge=106) both 64 (AI=16) and 128 (AI=32) are still far left of the
+# ridge, so both stay memory-bound and my measured runtime is flat (~0.868 ms both).
+# The jump the question describes doesn't occur on my hardware.
+# (Why the different ridges: ridge = peak compute / peak bandwidth. The H100's huge
+# 3,350 GB/s bandwidth feeds its cores easily, so it becomes math-limited sooner —
+# low ridge. The L40S's 864 GB/s keeps it data-starved much longer — high ridge.)
 
 # Q4. Why do the eager `ops-K` points look so different from the compiled ones?
-#Q4 — Eager AI stays flat (0.083→0.125 FLOP/Byte) while compiled marches right (0.25→32). 
-# Each eager iteration writes two intermediates back to global memory and reads them again next iteration — 
-# bytes scale with num_ops. 
-# Compiled fuses everything into one kernel: one read, one write regardless of num_ops.
-# Interesting anomaly to mention: matmul 4096 (35.1 TFLOP/s) underperforms matmul 2048 (42.4 TFLOP/s) — at 4096 the matrices are ~256MB total, exceeding L2 cache, causing more cache misses.
+#Q4 — The difference comes down to how many times the data travels to and from VRAM.
+
+#Compiled = fused into one kernel. 
+# All the math is done in a single pass: read the tensor once, 
+# do every operation while the data sits in fast on-chip registers, write once — no matter how many ops. 
+# So bytes moved stay fixed, and arithmetic intensity climbs as you add math (0.25 → 32 FLOP/Byte). 
+# The points march rightward and upward along the bandwidth ceiling.
+
+#Eager = a separate kernel for every step. 
+# Each * and each + runs on its own, writing its result back to VRAM and re-reading it for the next step. 
+# So the bytes moved grow right along with num_ops — more math always drags more memory traffic with it. 
+# Arithmetic intensity barely moves (0.083 → 0.125 FLOP/Byte), the points stay pinned in the bottom-left, 
+# and runtime scales almost linearly (1 op ≈ 2 ms → 128 ops ≈ 329 ms).
+
+#Compiled moves the data once and reuses it; eager re-loads it for every operation, 
+# so it's permanently memory-bound and gets dramatically slower as ops increase.
 
